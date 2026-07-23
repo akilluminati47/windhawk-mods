@@ -1,6 +1,6 @@
 // ==WindhawkMod==
 // @id              genie-minimize-animation-fork
-// @name            Linux Animation Pack (Genie + friends)
+// @name            Genie + Friends minimize animation pack
 // @description     macOS/Compiz-style minimize & restore effects: Genie, Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up, Swirl.
 // @version         2.2.1
 // @author          lolstijl (fork)
@@ -11,7 +11,7 @@
 
 // ==WindhawkModReadme==
 /*
-# Linux Animation Pack
+# Genie + Friends minimize animation pack
 
 A fork of the Genie Animation Mod that turns Windows 11's boring minimize/restore
 into a whole menu of Compiz/macOS-flavored effects. Pick one from the **Animation
