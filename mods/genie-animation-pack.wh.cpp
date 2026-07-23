@@ -2,7 +2,7 @@
 // @id              genie-minimize-animation-fork
 // @name            Linux Animation Pack (Genie + friends)
 // @description     macOS/Compiz-style minimize & restore effects: Genie, Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up, Swirl.
-// @version         2.2.0
+// @version         2.2.1
 // @author          lolstijl (fork)
 // @github          https://github.com/lolstijl
 // @include         *
@@ -42,6 +42,10 @@ Restore plays every effect in reverse, so windows *un-genie*, *un-roll*, drop ba
 in, etc.
 
 ## Notes
+- **v2.2.1 — no more first-frame flash.** The minimize/restore hook now waits (up
+  to 40ms) for the ghost's first frame to actually be on screen before the real
+  window changes, so the window can't blink out a few ms before the animation
+  appears when GPU setup is momentarily slow.
 - **v2.1 — GPU rendering.** The snapshot is now handed to the GPU compositor
   (DirectComposition) once, and each frame only pushes a transform + opacity. This
   is dramatically smoother on high-refresh displays (120/144/165/180+ Hz) and uses a
@@ -188,6 +192,7 @@ struct GhostAnimData {
     int mode;
     int durationMs;
     LONG_PTR originalExStyle;
+    HANDLE hReady; // signaled once the ghost's first frame is on screen (anti-flash)
 };
 
 // --- THE VAULTS ---
@@ -725,6 +730,9 @@ static void RunCpuAnim(GhostAnimData* data, HWND hGhost,
         if (firstFrame) {
             ShowWindow(hGhost, SW_SHOWNOACTIVATE);
             firstFrame = FALSE;
+            // Ghost's first frame is up: release the minimize/restore hook so the
+            // real window only changes now, not before the ghost exists.
+            if (data->hReady) SetEvent(data->hReady);
         }
 
         if (lastFrame) break;
@@ -903,6 +911,9 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
         if (firstFrame) {
             ShowWindow(hGhost, SW_SHOWNOACTIVATE);
             firstFrame = FALSE;
+            // Ghost's first frame is up: release the minimize/restore hook so the
+            // real window only changes now, not before the ghost exists.
+            if (data->hReady) SetEvent(data->hReady);
         }
 
         if (lastFrame) break;
@@ -1131,6 +1142,9 @@ static bool RunGpuGenieAnim(GhostAnimData* data, HWND hGhost,
         if (firstFrame) {
             ShowWindow(hGhost, SW_SHOWNOACTIVATE);
             firstFrame = FALSE;
+            // Ghost's first frame is up: release the minimize/restore hook so the
+            // real window only changes now, not before the ghost exists.
+            if (data->hReady) SetEvent(data->hReady);
         }
         if (lastFrame) break;
         DwmFlush();
@@ -1202,6 +1216,9 @@ DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
 
     if (hGhost) DestroyWindow(hGhost);
     DeleteObject(data->hBitmap);
+    // Close last: the loop above ran for >= durationMs (>= 50ms), long after the
+    // hook's short bounded wait on this event returned, so there's no race.
+    if (data->hReady) CloseHandle(data->hReady);
     delete data;
     return 0;
 }
@@ -1292,7 +1309,24 @@ void StartGenieAnim(HWND hWnd, BOOL rising) {
     SelectObject(hMemDC, hOldBmp);
     DeleteDC(hMemDC);
     ReleaseDC(NULL, hScreenDC);
-    CreateThread(NULL, 0, GhostAnimationThread, data, 0, NULL);
+
+    // Anti-flash: block the caller (the minimize/restore hook) until the ghost's
+    // first frame is on screen, so the real window never changes before the
+    // animation exists. Use a LOCAL copy of the handle for the wait — once the
+    // thread is spawned it owns `data` and may free it at any time. The cap (40ms)
+    // sits under the 50ms minimum duration, so the thread's CloseHandle at
+    // animation end can never race this bounded wait.
+    HANDLE hReady = CreateEventW(NULL, TRUE, FALSE, NULL);
+    data->hReady = hReady;
+    HANDLE hThread = CreateThread(NULL, 0, GhostAnimationThread, data, 0, NULL);
+    if (!hThread) {
+        if (hReady) CloseHandle(hReady);
+        DeleteObject(data->hBitmap);
+        delete data;
+        return;
+    }
+    CloseHandle(hThread);
+    if (hReady) WaitForSingleObject(hReady, 40);
 }
 
 // -------------------------------------------------------------------------
