@@ -59,8 +59,12 @@ in, etc.
   can't init, Genie falls back to the affine/GDI renderer.
 - Windows' own animation API is ancient, so a couple of effects (Warp especially) are
   clever fakes rather than true 3D — but they read great in motion.
-- Originally written with the help of Gemini & Claude; this multi-effect pack was
-  extended by Claude.
+## Credits
+Built on the original **Genie Animation Mod**. **lolstijl** extended it into this
+multi-effect pack (Genie + nine more Compiz/macOS-style effects). **akilluminati47**
+then rewrote the rendering onto the GPU (DirectComposition), added the true
+mesh-warped Genie bend, and the anti-flash timing fix. Development was assisted by
+Claude and Gemini.
 */
 // ==/WindhawkModReadme==
 
