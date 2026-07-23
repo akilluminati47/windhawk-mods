@@ -2,11 +2,11 @@
 // @id              genie-minimize-animation-fork
 // @name            Linux Animation Pack (Genie + friends)
 // @description     macOS/Compiz-style minimize & restore effects: Genie, Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up, Swirl.
-// @version         2.1.0
+// @version         2.2.0
 // @author          lolstijl (fork)
 // @github          https://github.com/lolstijl
 // @include         *
-// @compilerOptions -ldwmapi -lgdi32 -ld3d11 -ldxgi -ldcomp
+// @compilerOptions -ldwmapi -lgdi32 -ld3d11 -ldxgi -ldcomp -ld3dcompiler
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -48,10 +48,13 @@ in, etc.
   fraction of the CPU the old per-frame `StretchBlt` did. If DirectComposition isn't
   available in a given process, it silently falls back to the original GDI renderer,
   so nothing breaks.
+- **v2.2 — true Genie bend.** Genie is no longer a shrink + slide fake: it now renders
+  the snapshot as a tessellated mesh warped every frame by a small GPU shader, so the
+  window body curves into a thin neck that pours into the taskbar (real Magic Lamp).
+  The other nine effects keep the cheap single-transform GPU path. If the shader stack
+  can't init, Genie falls back to the affine/GDI renderer.
 - Windows' own animation API is ancient, so a couple of effects (Warp especially) are
-  clever fakes rather than true 3D — but they read great in motion. Genie is currently
-  an affine (shrink + slide) approximation of the Magic Lamp; a true mesh-warped bend
-  is planned next.
+  clever fakes rather than true 3D — but they read great in motion.
 - Originally written with the help of Gemini & Claude; this multi-effect pack was
   extended by Claude.
 */
@@ -129,10 +132,13 @@ in, etc.
 #include <dwmapi.h>
 #include <d2d1.h>     // D2D_MATRIX_3X2_F used by IDCompositionMatrixTransform
 #include <d3d11.h>
+#include <d3dcompiler.h>  // runtime HLSL compile for the Genie mesh shaders
 #include <dxgi1_2.h>
 #include <dcomp.h>
 #include <math.h>
 #include <wchar.h>
+#include <stdlib.h>
+#include <string.h>
 #include <atomic>
 #include <unordered_map>
 #include <mutex>
@@ -297,6 +303,165 @@ static void ReleaseGpuDevice() {
     SafeRelease(g_d3dDevice);
     g_gpuAvailable = false;
     g_gpuInitTried = false;
+}
+
+// -------------------------------------------------------------------------
+// Genie mesh (true Magic-Lamp bend)
+//
+// The other nine effects are pure scale+translate+fade, so they upload the
+// snapshot once and only push a transform per frame. Genie's signature is a
+// non-affine bend — the window body curves into a thin neck that pours into the
+// taskbar — which a single matrix can't express. So Genie instead renders a
+// tessellated, textured grid of the snapshot every frame with a tiny HLSL
+// shader, displacing each grid row toward the dock.
+//
+// The pipeline objects that never change (shaders, input layout, grid index
+// buffer, sampler/rasterizer/constant buffers) are built once on the shared
+// device and reused. Only the per-vertex positions (a dynamic vertex buffer)
+// and the swapchain/render-target are per-animation.
+// -------------------------------------------------------------------------
+static const int  GENIE_GX = 8;    // grid columns  (few: rows are ~straight across)
+static const int  GENIE_GY = 64;   // grid rows     (many: the bend runs vertically)
+
+struct GenieVertex { float x, y; float u, v; };   // NDC position + texcoord
+
+static std::mutex             g_genieMutex;
+static bool                   g_genieTried = false;
+static bool                   g_genieOk    = false;
+static ID3D11VertexShader*    g_gVS       = nullptr;
+static ID3D11PixelShader*     g_gPS       = nullptr;
+static ID3D11InputLayout*     g_gLayout   = nullptr;
+static ID3D11Buffer*          g_gIndexBuf = nullptr;   // static grid connectivity
+static ID3D11Buffer*          g_gConstBuf = nullptr;   // { float alpha; float3 pad; }
+static ID3D11SamplerState*    g_gSampler  = nullptr;
+static ID3D11RasterizerState* g_gRaster   = nullptr;
+static UINT                   g_gIndexCount = 0;
+
+static const char* kGenieVS =
+    "struct VIn  { float2 pos:POSITION; float2 tex:TEXCOORD; };\n"
+    "struct VOut { float4 pos:SV_POSITION; float2 tex:TEXCOORD; };\n"
+    "VOut main(VIn i){ VOut o; o.pos=float4(i.pos,0,1); o.tex=i.tex; return o; }\n";
+
+static const char* kGeniePS =
+    "Texture2D gTex:register(t0); SamplerState gSmp:register(s0);\n"
+    "cbuffer C:register(b0){ float gAlpha; float3 pad; };\n"
+    "struct VOut { float4 pos:SV_POSITION; float2 tex:TEXCOORD; };\n"
+    "float4 main(VOut i):SV_TARGET{\n"
+    "  float4 c = gTex.Sample(gSmp, i.tex);\n"
+    "  return float4(c.rgb * gAlpha, gAlpha);\n"   // premultiplied; snapshot is opaque
+    "}\n";
+
+// Build the one-time Genie pipeline objects on the shared device. Returns false
+// if anything fails (caller then falls back to the affine/CPU Genie).
+static bool EnsureGenieGpuResources() {
+    std::lock_guard<std::mutex> lock(g_genieMutex);
+    if (g_genieTried) return g_genieOk;
+    g_genieTried = true;
+    if (!g_d3dDevice) return false;
+
+    ID3DBlob* vsb = nullptr;
+    ID3DBlob* psb = nullptr;
+    ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(kGenieVS, strlen(kGenieVS), "genieVS", nullptr, nullptr,
+                            "main", "vs_4_0", 0, 0, &vsb, &err);
+    SafeRelease(err);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(kGeniePS, strlen(kGeniePS), "geniePS", nullptr, nullptr,
+                        "main", "ps_4_0", 0, 0, &psb, &err);
+    SafeRelease(err);
+    if (FAILED(hr)) { SafeRelease(vsb); SafeRelease(psb); return false; }
+
+    bool ok =
+        SUCCEEDED(g_d3dDevice->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g_gVS)) &&
+        SUCCEEDED(g_d3dDevice->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g_gPS));
+
+    if (ok) {
+        D3D11_INPUT_ELEMENT_DESC il[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
+        ok = SUCCEEDED(g_d3dDevice->CreateInputLayout(il, 2, vsb->GetBufferPointer(),
+                                                      vsb->GetBufferSize(), &g_gLayout));
+    }
+    SafeRelease(vsb);
+    SafeRelease(psb);
+    if (!ok) return false;
+
+    // Static grid index buffer: two triangles per cell.
+    {
+        const int cols = GENIE_GX + 1;
+        UINT* idx = (UINT*)malloc((size_t)GENIE_GX * GENIE_GY * 6 * sizeof(UINT));
+        if (!idx) return false;
+        UINT n = 0;
+        for (int j = 0; j < GENIE_GY; j++) {
+            for (int i = 0; i < GENIE_GX; i++) {
+                UINT tl = (UINT)(j * cols + i);
+                UINT tr = tl + 1;
+                UINT bl = tl + cols;
+                UINT br = bl + 1;
+                idx[n++] = tl; idx[n++] = bl; idx[n++] = tr;
+                idx[n++] = tr; idx[n++] = bl; idx[n++] = br;
+            }
+        }
+        g_gIndexCount = n;
+        D3D11_BUFFER_DESC bd;
+        ZeroMemory(&bd, sizeof(bd));
+        bd.ByteWidth = (UINT)(n * sizeof(UINT));
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA sd;
+        ZeroMemory(&sd, sizeof(sd));
+        sd.pSysMem = idx;
+        HRESULT ihr = g_d3dDevice->CreateBuffer(&bd, &sd, &g_gIndexBuf);
+        free(idx);
+        if (FAILED(ihr)) return false;
+    }
+
+    // Constant buffer (alpha) — dynamic, updated per frame.
+    {
+        D3D11_BUFFER_DESC bd;
+        ZeroMemory(&bd, sizeof(bd));
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(g_d3dDevice->CreateBuffer(&bd, nullptr, &g_gConstBuf))) return false;
+    }
+
+    // Linear clamp sampler.
+    {
+        D3D11_SAMPLER_DESC sd;
+        ZeroMemory(&sd, sizeof(sd));
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(g_d3dDevice->CreateSamplerState(&sd, &g_gSampler))) return false;
+    }
+
+    // Cull nothing — the warp can flip triangle winding.
+    {
+        D3D11_RASTERIZER_DESC rd;
+        ZeroMemory(&rd, sizeof(rd));
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        if (FAILED(g_d3dDevice->CreateRasterizerState(&rd, &g_gRaster))) return false;
+    }
+
+    g_genieOk = true;
+    return true;
+}
+
+static void ReleaseGenieGpuResources() {
+    std::lock_guard<std::mutex> lock(g_genieMutex);
+    SafeRelease(g_gRaster);
+    SafeRelease(g_gSampler);
+    SafeRelease(g_gConstBuf);
+    SafeRelease(g_gIndexBuf);
+    SafeRelease(g_gLayout);
+    SafeRelease(g_gPS);
+    SafeRelease(g_gVS);
+    g_genieOk = false;
+    g_genieTried = false;
 }
 
 // -------------------------------------------------------------------------
@@ -758,6 +923,235 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
 }
 
 // -------------------------------------------------------------------------
+// GPU Genie renderer. Renders a bent, textured grid of the snapshot every frame
+// into a full-screen composition swapchain. Returns false on any setup failure
+// so the caller can fall back to the affine/CPU Genie. hGhost must be the
+// full-screen WS_EX_NOREDIRECTIONBITMAP popup.
+// -------------------------------------------------------------------------
+static bool RunGpuGenieAnim(GhostAnimData* data, HWND hGhost,
+                            int screenWidth, int screenHeight, float taskbarY) {
+    if (!EnsureGenieGpuResources()) return false;
+
+    const int w = data->width;
+    const int h = data->height;
+
+    // Snapshot -> top-down BGRA, forced opaque (same as the affine path).
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = w;
+    bmi.bmiHeader.biHeight      = -h;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    const size_t stride = (size_t)w * 4;
+    BYTE* bits = (BYTE*)malloc(stride * (size_t)h);
+    if (!bits) return false;
+    HDC hScreenDC = GetDC(NULL);
+    int scan = GetDIBits(hScreenDC, data->hBitmap, 0, h, bits, &bmi, DIB_RGB_COLORS);
+    ReleaseDC(NULL, hScreenDC);
+    if (scan == 0) { free(bits); return false; }
+    for (size_t i = 0; i < (size_t)w * (size_t)h; i++) bits[i * 4 + 3] = 0xFF;
+
+    const int vertCount = (GENIE_GX + 1) * (GENIE_GY + 1);
+    const UINT vbBytes  = (UINT)(vertCount * sizeof(GenieVertex));
+
+    ID3D11Texture2D*             srcTex      = nullptr;
+    ID3D11ShaderResourceView*    srv         = nullptr;
+    IDXGISwapChain1*             swapChain   = nullptr;
+    ID3D11RenderTargetView*      rtv         = nullptr;
+    ID3D11Buffer*                vbuf        = nullptr;
+    ID3D11DeviceContext*         ctx         = nullptr;
+    IDXGIDevice*                 dxgiDev     = nullptr;
+    IDCompositionDesktopDevice*  dcompDevice = nullptr;
+    IDCompositionTarget*         dcompTarget = nullptr;
+    IDCompositionVisual2*        visual      = nullptr;
+    bool ok = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_gpuCtxMutex);
+
+        D3D11_TEXTURE2D_DESC td;
+        ZeroMemory(&td, sizeof(td));
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA srd;
+        ZeroMemory(&srd, sizeof(srd));
+        srd.pSysMem = bits;
+        srd.SysMemPitch = (UINT)stride;
+
+        if (SUCCEEDED(g_d3dDevice->CreateTexture2D(&td, &srd, &srcTex)) &&
+            SUCCEEDED(g_d3dDevice->CreateShaderResourceView(srcTex, nullptr, &srv))) {
+
+            DXGI_SWAP_CHAIN_DESC1 scd;
+            ZeroMemory(&scd, sizeof(scd));
+            scd.Width  = screenWidth;
+            scd.Height = screenHeight;
+            scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            scd.SampleDesc.Count = 1;
+            scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            scd.BufferCount = 2;
+            scd.Scaling    = DXGI_SCALING_STRETCH;
+            scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            scd.AlphaMode  = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+            if (SUCCEEDED(g_dxgiFactory->CreateSwapChainForComposition(g_d3dDevice, &scd, nullptr, &swapChain))) {
+                ID3D11Texture2D* backBuf = nullptr;
+                if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuf)) && backBuf) {
+                    g_d3dDevice->CreateRenderTargetView(backBuf, nullptr, &rtv);
+                    backBuf->Release();
+                }
+            }
+
+            D3D11_BUFFER_DESC vbd;
+            ZeroMemory(&vbd, sizeof(vbd));
+            vbd.ByteWidth = vbBytes;
+            vbd.Usage = D3D11_USAGE_DYNAMIC;
+            vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            g_d3dDevice->CreateBuffer(&vbd, nullptr, &vbuf);
+        }
+
+        if (rtv && vbuf && srv &&
+            SUCCEEDED(g_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) &&
+            SUCCEEDED(DCompositionCreateDevice2(dxgiDev, __uuidof(IDCompositionDesktopDevice), (void**)&dcompDevice)) &&
+            SUCCEEDED(dcompDevice->CreateTargetForHwnd(hGhost, TRUE, &dcompTarget)) &&
+            SUCCEEDED(dcompDevice->CreateVisual(&visual))) {
+            g_d3dDevice->GetImmediateContext(&ctx);
+            visual->SetContent(swapChain);
+            dcompTarget->SetRoot(visual);
+            dcompDevice->Commit();
+            ok = (ctx != nullptr);
+        }
+        SafeRelease(dxgiDev);
+    }
+
+    free(bits);
+
+    GenieVertex* verts = ok ? (GenieVertex*)malloc(vbBytes) : nullptr;
+    if (!ok || !verts) {
+        if (verts) free(verts);
+        SafeRelease(ctx);
+        SafeRelease(visual);
+        SafeRelease(dcompTarget);
+        SafeRelease(dcompDevice);
+        SafeRelease(vbuf);
+        SafeRelease(rtv);
+        SafeRelease(swapChain);
+        SafeRelease(srv);
+        SafeRelease(srcTex);
+        return false;
+    }
+
+    // Genie shape constants — tweak to taste.
+    const float LEAD     = 1.4f;                          // how far the window's bottom leads its top into the neck
+    const float neckW    = (w * 0.05f > 10.0f) ? w * 0.05f : 10.0f; // drained-neck width (px)
+    const float sourceCX = data->targetRect.left + w * 0.5f;
+    const float dockX    = (float)data->targetDockX;
+    const float dockY    = taskbarY;
+    const float srcTop   = (float)data->targetRect.top;
+
+    const double totalMs = (double)data->durationMs;
+    LARGE_INTEGER qpcFreq, qpcStart, qpcNow;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcStart);
+
+    BOOL firstFrame = TRUE;
+    for (;;) {
+        QueryPerformanceCounter(&qpcNow);
+        double elapsedMs = (qpcNow.QuadPart - qpcStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
+        BOOL lastFrame = (elapsedMs >= totalMs);
+        float progress = lastFrame ? 1.0f : (float)(elapsedMs / totalMs);
+        float p = data->isRising ? (1.0f - progress) : progress;
+
+        // Build the bent grid in screen NDC.
+        int vi = 0;
+        for (int j = 0; j <= GENIE_GY; j++) {
+            float v    = (float)j / (float)GENIE_GY;
+            float rowP = clampf(p * (1.0f + LEAD) - (1.0f - v) * LEAD, 0.0f, 1.0f);
+            float pinch   = rowP * rowP * (3.0f - 2.0f * rowP); // smoothstep: horizontal funnel
+            float descend = rowP * rowP * rowP;                 // easeInCubic: vertical dive
+            float rowW  = w + (neckW - w) * pinch;
+            float rowCX = sourceCX + (dockX - sourceCX) * pinch;
+            float rowY  = (srcTop + v * h) + (dockY - (srcTop + v * h)) * descend;
+            for (int i = 0; i <= GENIE_GX; i++) {
+                float u = (float)i / (float)GENIE_GX;
+                float xpx = rowCX + (u - 0.5f) * rowW;
+                verts[vi].x = xpx / (float)screenWidth * 2.0f - 1.0f;
+                verts[vi].y = 1.0f - rowY / (float)screenHeight * 2.0f;
+                verts[vi].u = u;
+                verts[vi].v = v;
+                vi++;
+            }
+        }
+        float alpha = (p < 0.75f) ? 1.0f : clampf(1.0f - (p - 0.75f) / 0.25f, 0.0f, 1.0f);
+
+        {
+            std::lock_guard<std::mutex> lock(g_gpuCtxMutex);
+
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (SUCCEEDED(ctx->Map(vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                memcpy(ms.pData, verts, vbBytes);
+                ctx->Unmap(vbuf, 0);
+            }
+            if (SUCCEEDED(ctx->Map(g_gConstBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                float c[4] = { alpha, 0.0f, 0.0f, 0.0f };
+                memcpy(ms.pData, c, sizeof(c));
+                ctx->Unmap(g_gConstBuf, 0);
+            }
+
+            UINT strideV = sizeof(GenieVertex), offsetV = 0;
+            ctx->IASetInputLayout(g_gLayout);
+            ctx->IASetVertexBuffers(0, 1, &vbuf, &strideV, &offsetV);
+            ctx->IASetIndexBuffer(g_gIndexBuf, DXGI_FORMAT_R32_UINT, 0);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(g_gVS, nullptr, 0);
+            ctx->PSSetShader(g_gPS, nullptr, 0);
+            ctx->PSSetShaderResources(0, 1, &srv);
+            ctx->PSSetSamplers(0, 1, &g_gSampler);
+            ctx->PSSetConstantBuffers(0, 1, &g_gConstBuf);
+            ctx->RSSetState(g_gRaster);
+            D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)screenWidth, (float)screenHeight, 0.0f, 1.0f };
+            ctx->RSSetViewports(1, &vp);
+            float clearCol[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            ctx->ClearRenderTargetView(rtv, clearCol);
+            ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+            ctx->DrawIndexed(g_gIndexCount, 0, 0);
+
+            DXGI_PRESENT_PARAMETERS pp;
+            ZeroMemory(&pp, sizeof(pp));
+            swapChain->Present1(0, 0, &pp);
+        }
+
+        if (firstFrame) {
+            ShowWindow(hGhost, SW_SHOWNOACTIVATE);
+            firstFrame = FALSE;
+        }
+        if (lastFrame) break;
+        DwmFlush();
+    }
+
+    FinalizeRealWindow(data);
+
+    free(verts);
+    SafeRelease(ctx);
+    SafeRelease(visual);
+    SafeRelease(dcompTarget);
+    SafeRelease(dcompDevice);
+    SafeRelease(vbuf);
+    SafeRelease(rtv);
+    SafeRelease(swapChain);
+    SafeRelease(srv);
+    SafeRelease(srcTex);
+    return true;
+}
+
+// -------------------------------------------------------------------------
 // Animation Thread
 // -------------------------------------------------------------------------
 DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
@@ -784,7 +1178,13 @@ DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
             L"STATIC", NULL, WS_POPUP,
             0, 0, screenWidth, screenHeight, NULL, NULL, NULL, NULL);
 
-        if (!hGhost || !RunGpuAnim(data, hGhost, screenWidth, screenHeight, taskbarY)) {
+        bool ran = false;
+        if (hGhost) {
+            ran = (data->mode == MODE_GENIE)
+                    ? RunGpuGenieAnim(data, hGhost, screenWidth, screenHeight, taskbarY)
+                    : RunGpuAnim(data, hGhost, screenWidth, screenHeight, taskbarY);
+        }
+        if (!ran) {
             useGpu = false;
             if (hGhost) { DestroyWindow(hGhost); hGhost = NULL; }
         }
@@ -974,5 +1374,6 @@ void Wh_ModUninit() {
     }
     // Any in-flight animation threads own their own DirectComposition devices and
     // will finish shortly; only the shared D3D device + factory live here.
+    ReleaseGenieGpuResources();
     ReleaseGpuDevice();
 }
