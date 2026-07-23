@@ -1,10 +1,10 @@
 // ==WindhawkMod==
 // @id              genie-minimize-animation-fork
 // @name            Genie + Friends minimize animation pack
-// @description     macOS/Compiz-style minimize & restore effects: Genie, Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up, Swirl.
+// @description     GPU-accelerated macOS/Compiz-style minimize & restore effects — Genie (true mesh bend), Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up & Swirl.
 // @version         2.2.1
-// @author          lolstijl (fork)
-// @github          https://github.com/lolstijl
+// @author          lolstijl & akilluminati47
+// @github          https://github.com/akilluminati47
 // @include         *
 // @compilerOptions -ldwmapi -lgdi32 -ld3d11 -ldxgi -ldcomp -ld3dcompiler
 // ==/WindhawkMod==
