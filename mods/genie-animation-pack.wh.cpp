@@ -2,11 +2,11 @@
 // @id              genie-minimize-animation-fork
 // @name            Linux Animation Pack (Genie + friends)
 // @description     macOS/Compiz-style minimize & restore effects: Genie, Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up, Swirl.
-// @version         2.0.0
+// @version         2.1.0
 // @author          lolstijl (fork)
 // @github          https://github.com/lolstijl
 // @include         *
-// @compilerOptions -ldwmapi -lgdi32
+// @compilerOptions -ldwmapi -lgdi32 -ld3d11 -ldxgi -ldcomp
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -42,10 +42,16 @@ Restore plays every effect in reverse, so windows *un-genie*, *un-roll*, drop ba
 in, etc.
 
 ## Notes
-- These animations can spike CPU if you spam minimize/restore very fast, because each
-  one runs a short real-time render thread. Normal use is fine.
+- **v2.1 — GPU rendering.** The snapshot is now handed to the GPU compositor
+  (DirectComposition) once, and each frame only pushes a transform + opacity. This
+  is dramatically smoother on high-refresh displays (120/144/165/180+ Hz) and uses a
+  fraction of the CPU the old per-frame `StretchBlt` did. If DirectComposition isn't
+  available in a given process, it silently falls back to the original GDI renderer,
+  so nothing breaks.
 - Windows' own animation API is ancient, so a couple of effects (Warp especially) are
-  clever GDI fakes rather than true 3D — but they read great in motion.
+  clever fakes rather than true 3D — but they read great in motion. Genie is currently
+  an affine (shrink + slide) approximation of the Magic Lamp; a true mesh-warped bend
+  is planned next.
 - Originally written with the help of Gemini & Claude; this multi-effect pack was
   extended by Claude.
 */
@@ -121,6 +127,10 @@ in, etc.
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <d2d1.h>     // D2D_MATRIX_3X2_F used by IDCompositionMatrixTransform
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <dcomp.h>
 #include <math.h>
 #include <wchar.h>
 #include <atomic>
@@ -208,6 +218,85 @@ void LoadSettings() {
 void SetDwmTransitions(HWND hWnd, BOOL enable) {
     BOOL disable = !enable;
     DwmSetWindowAttribute(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
+}
+
+template <class T> static inline void SafeRelease(T*& p) {
+    if (p) { p->Release(); p = nullptr; }
+}
+
+// -------------------------------------------------------------------------
+// GPU (DirectComposition) backend
+//
+// The heavy part of the old renderer was re-running a HALFTONE StretchBlt of
+// the whole window bitmap on the CPU every single frame, then re-uploading it
+// via UpdateLayeredWindow. At 180 Hz the per-frame budget is ~5.5 ms and that
+// resample routinely blew past it on big windows, so frames were dropped.
+//
+// Every effect in this mod is really just scale + translate + fade of a static
+// snapshot (even "Genie" here is an affine fake, not a real mesh bend). That
+// means we can hand the snapshot to the GPU compositor ONCE as a texture and,
+// each frame, only push a 3x2 matrix + an opacity value. The GPU does the
+// resample for free, bilinear-filtered, at native refresh. Per-frame CPU cost
+// drops to a few floats + a Commit, which never misses the frame budget.
+//
+// One D3D11 device + DXGI factory are created lazily per process and reused for
+// every animation (device creation is tens of ms — far too slow to do per
+// minimize). Each animation gets its own lightweight DirectComposition device
+// so its hot loop needs no locks. If any of this fails (no GPU, locked-down
+// process, older Windows), we fall back to the original GDI renderer.
+// -------------------------------------------------------------------------
+static std::mutex        g_gpuInitMutex;
+static std::mutex        g_gpuCtxMutex;   // serializes shared D3D device/context/factory use
+static bool              g_gpuInitTried = false;
+static bool              g_gpuAvailable = false;
+static ID3D11Device*     g_d3dDevice    = nullptr;  // shared across animation threads
+static IDXGIFactory2*    g_dxgiFactory  = nullptr;  // shared
+
+// Create (once) the shared D3D11 device + DXGI factory. Returns false if the
+// GPU path can't be used in this process; caller then uses the CPU fallback.
+static bool EnsureGpuDevice() {
+    std::lock_guard<std::mutex> lock(g_gpuInitMutex);
+    if (g_gpuInitTried) return g_gpuAvailable;
+    g_gpuInitTried = true;
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    D3D_FEATURE_LEVEL fl;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        nullptr, 0, D3D11_SDK_VERSION, &g_d3dDevice, &fl, nullptr);
+    if (FAILED(hr)) {
+        // Retry on WARP so software-rendering / GPU-less sessions still work.
+        hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+            nullptr, 0, D3D11_SDK_VERSION, &g_d3dDevice, &fl, nullptr);
+    }
+    if (FAILED(hr) || !g_d3dDevice) return false;
+
+    // The shared device + its immediate context are touched from every animation
+    // thread only during the brief per-animation setup (create texture/swapchain,
+    // copy, present). Those calls are serialized with g_gpuCtxMutex; the hot
+    // per-frame loop runs on a private DirectComposition device and takes no lock.
+
+    IDXGIDevice* dxgiDev = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    if (SUCCEEDED(g_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) &&
+        SUCCEEDED(dxgiDev->GetAdapter(&adapter)) &&
+        SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory2), (void**)&g_dxgiFactory))) {
+        g_gpuAvailable = true;
+    }
+    SafeRelease(adapter);
+    SafeRelease(dxgiDev);
+
+    if (!g_gpuAvailable) SafeRelease(g_d3dDevice);
+    return g_gpuAvailable;
+}
+
+static void ReleaseGpuDevice() {
+    std::lock_guard<std::mutex> lock(g_gpuInitMutex);
+    SafeRelease(g_dxgiFactory);
+    SafeRelease(g_d3dDevice);
+    g_gpuAvailable = false;
+    g_gpuInitTried = false;
 }
 
 // -------------------------------------------------------------------------
@@ -399,34 +488,26 @@ static void SolveFrame(const GhostAnimData* d, float t,
     *outAlpha = clampf(alpha, 0.0f, 1.0f);
 }
 
+// Reveal the real window (on restore) and undo the force-disabled DWM
+// transitions. Runs once per animation, after the render loop, while the ghost
+// still shows the final full-size frame so there's no gap under the real window.
+static void FinalizeRealWindow(GhostAnimData* data) {
+    if (data->isRising) {
+        SetLayeredWindowAttributes(data->hRealWnd, 0, 255, LWA_ALPHA);
+        if (!(data->originalExStyle & WS_EX_LAYERED)) {
+            SetWindowLongPtrW(data->hRealWnd, GWL_EXSTYLE, data->originalExStyle);
+        }
+    }
+    SetDwmTransitions(data->hRealWnd, TRUE);
+}
+
 // -------------------------------------------------------------------------
-// Animation Thread
+// CPU renderer (fallback). Original GDI StretchBlt + UpdateLayeredWindow path,
+// used when the GPU/DirectComposition path is unavailable in this process.
+// hGhost must be a WS_EX_LAYERED popup sized to the window rect.
 // -------------------------------------------------------------------------
-DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
-    GhostAnimData* data = (GhostAnimData*)lpParam;
-
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
-
-    RECT workArea;
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    float taskbarY = (float)workArea.bottom;
-
-    // Create the ghost without WS_VISIBLE so it isn't briefly shown as an
-    // uninitialized layered window. UpdateLayeredWindow below configures it
-    // before we make it visible.
-    HWND hGhost = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
-        L"STATIC", NULL, WS_POPUP,
-        data->targetRect.left, data->targetRect.top, data->width, data->height,
-        NULL, NULL, NULL, NULL
-    );
-
-    // Two memory DCs:
-    //   hOrigDC   - holds the captured window snapshot at original size.
-    //   hScaledDC - holds a per-frame transformed copy, fed to UpdateLayeredWindow.
+static void RunCpuAnim(GhostAnimData* data, HWND hGhost,
+                       int screenWidth, int screenHeight, float taskbarY) {
     // The scaled bitmap is allocated a bit LARGER than the window so effects that
     // temporarily scale up (Pop, Free Fall, Squash) don't get clipped.
     int capW = (int)(data->width  * 1.30f) + 4;
@@ -444,13 +525,7 @@ DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
     SetStretchBltMode(hScaledDC, HALFTONE);
     SetBrushOrgEx(hScaledDC, 0, 0, NULL);
 
-    // Snapshot the cached duration once. The cache is refreshed by
-    // Wh_ModSettingsChanged, so user edits take effect on the next animation.
     const double totalMs = (double)data->durationMs;
-
-    // Time-based progress synced to the DWM compose cycle via DwmFlush. Driving
-    // progress by real elapsed time and gating each frame on the next compose
-    // cycle means every frame we render is exactly one frame the user sees.
     LARGE_INTEGER qpcFreq, qpcStart, qpcNow;
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&qpcStart);
@@ -469,14 +544,9 @@ DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
                    &newW, &newH, &currentX, &currentY, &alphaFloat);
         BYTE alpha = (BYTE)(255.0f * alphaFloat);
 
-        // Stretch the snapshot into the top-left sub-region of the scaled bitmap.
-        // UpdateLayeredWindow only reads exactly (0,0)-(newW,newH) via the SIZE we
-        // pass, so pixels outside that region never leak on screen.
         StretchBlt(hScaledDC, 0, 0, newW, newH,
                    hOrigDC, 0, 0, data->width, data->height, SRCCOPY);
 
-        // Single atomic update: position + size + bitmap + per-window alpha, all
-        // committed in one composition pass.
         POINT ptDst = { currentX, currentY };
         SIZE  sz    = { newW, newH };
         POINT ptSrc = { 0, 0 };
@@ -493,30 +563,244 @@ DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
         }
 
         if (lastFrame) break;
-
-        // Block until the next DWM compose cycle - the vsync sync point.
-        DwmFlush();
+        DwmFlush(); // block until the next DWM compose cycle - the vsync sync point
     }
 
-    if (data->isRising) {
-        SetLayeredWindowAttributes(data->hRealWnd, 0, 255, LWA_ALPHA);
-        if (!(data->originalExStyle & WS_EX_LAYERED)) {
-            SetWindowLongPtrW(data->hRealWnd, GWL_EXSTYLE, data->originalExStyle);
-        }
-    }
-
-    // Re-enable DWM transitions on the real window now that our animation is done,
-    // otherwise transitions stay force-disabled permanently for any window we touch.
-    SetDwmTransitions(data->hRealWnd, TRUE);
+    FinalizeRealWindow(data);
 
     SelectObject(hScaledDC, hOldScaled);
     SelectObject(hOrigDC, hOldOrig);
     DeleteObject(hScaledBitmap);
-    DeleteObject(data->hBitmap);
     DeleteDC(hScaledDC);
     DeleteDC(hOrigDC);
     ReleaseDC(NULL, hScreenDC);
-    DestroyWindow(hGhost);
+}
+
+// -------------------------------------------------------------------------
+// GPU renderer (DirectComposition). Uploads the snapshot to the GPU once, then
+// per frame only pushes a 3x2 transform + an opacity value and commits. Returns
+// false if any setup step fails, so the caller can fall back to the CPU path.
+// hGhost must be a full-screen WS_EX_NOREDIRECTIONBITMAP popup.
+// -------------------------------------------------------------------------
+static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
+                       int screenWidth, int screenHeight, float taskbarY) {
+    const int w = data->width;
+    const int h = data->height;
+
+    // 1. Pull the snapshot out as top-down 32-bit BGRA and force it opaque
+    //    (the snapshot carries no meaningful alpha; premultiplied-opaque = same RGB).
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = w;
+    bmi.bmiHeader.biHeight      = -h;      // negative = top-down
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    const size_t stride = (size_t)w * 4;
+    BYTE* bits = (BYTE*)malloc(stride * (size_t)h);
+    if (!bits) return false;
+
+    HDC hScreenDC = GetDC(NULL);
+    int scan = GetDIBits(hScreenDC, data->hBitmap, 0, h, bits, &bmi, DIB_RGB_COLORS);
+    ReleaseDC(NULL, hScreenDC);
+    if (scan == 0) { free(bits); return false; }
+    for (size_t i = 0; i < (size_t)w * (size_t)h; i++) bits[i * 4 + 3] = 0xFF;
+
+    // 2. Everything that touches the shared D3D device/context/factory is done
+    //    under one lock; it runs once per animation and is off the hot path.
+    IDXGISwapChain1*             swapChain   = nullptr;
+    IDXGIDevice*                 dxgiDev     = nullptr;
+    IDCompositionDesktopDevice*  dcompDevice = nullptr;
+    IDCompositionTarget*         dcompTarget = nullptr;
+    IDCompositionVisual2*        visual      = nullptr;
+    IDCompositionVisual3*        visual3     = nullptr;
+    IDCompositionMatrixTransform* xform      = nullptr;
+    bool ok = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_gpuCtxMutex);
+
+        D3D11_TEXTURE2D_DESC td;
+        ZeroMemory(&td, sizeof(td));
+        td.Width  = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA srd;
+        ZeroMemory(&srd, sizeof(srd));
+        srd.pSysMem = bits;
+        srd.SysMemPitch = (UINT)stride;
+
+        ID3D11Texture2D* srcTex = nullptr;
+        HRESULT hr = g_d3dDevice->CreateTexture2D(&td, &srd, &srcTex);
+        if (SUCCEEDED(hr) && srcTex) {
+            DXGI_SWAP_CHAIN_DESC1 scd;
+            ZeroMemory(&scd, sizeof(scd));
+            scd.Width  = w;
+            scd.Height = h;
+            scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            scd.SampleDesc.Count = 1;
+            scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            scd.BufferCount = 2;
+            scd.Scaling    = DXGI_SCALING_STRETCH;
+            scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+            scd.AlphaMode  = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+            hr = g_dxgiFactory->CreateSwapChainForComposition(g_d3dDevice, &scd, nullptr, &swapChain);
+            if (SUCCEEDED(hr) && swapChain) {
+                ID3D11Texture2D* backBuf = nullptr;
+                if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuf)) && backBuf) {
+                    ID3D11DeviceContext* ctx = nullptr;
+                    g_d3dDevice->GetImmediateContext(&ctx);
+                    if (ctx) {
+                        ctx->CopyResource(backBuf, srcTex);
+                        ctx->Release();
+                    }
+                    backBuf->Release();
+                }
+                DXGI_PRESENT_PARAMETERS pp;
+                ZeroMemory(&pp, sizeof(pp));
+                swapChain->Present1(0, 0, &pp);
+            }
+        }
+        SafeRelease(srcTex);
+
+        if (swapChain &&
+            SUCCEEDED(g_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) &&
+            SUCCEEDED(DCompositionCreateDevice2(dxgiDev, __uuidof(IDCompositionDesktopDevice), (void**)&dcompDevice)) &&
+            SUCCEEDED(dcompDevice->CreateTargetForHwnd(hGhost, TRUE, &dcompTarget)) &&
+            SUCCEEDED(dcompDevice->CreateVisual(&visual)) &&
+            SUCCEEDED(dcompDevice->CreateMatrixTransform(&xform)) &&
+            SUCCEEDED(visual->QueryInterface(__uuidof(IDCompositionVisual3), (void**)&visual3))) {
+            visual->SetContent(swapChain);
+            visual->SetTransform(xform);
+            dcompTarget->SetRoot(visual);
+            ok = true;
+        }
+        SafeRelease(dxgiDev);
+    }
+
+    free(bits);
+
+    if (!ok) {
+        SafeRelease(xform);
+        SafeRelease(visual3);
+        SafeRelease(visual);
+        SafeRelease(dcompTarget);
+        SafeRelease(dcompDevice);
+        SafeRelease(swapChain);
+        return false;
+    }
+
+    // 3. Hot loop: compute the affine transform for this frame and commit. The
+    //    GPU resamples the snapshot; per-frame CPU cost is a handful of floats.
+    const int capW = (int)(w * 1.30f) + 4;
+    const int capH = (int)(h * 1.30f) + 4;
+    const double totalMs = (double)data->durationMs;
+    LARGE_INTEGER qpcFreq, qpcStart, qpcNow;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcStart);
+
+    BOOL firstFrame = TRUE;
+    for (;;) {
+        QueryPerformanceCounter(&qpcNow);
+        double elapsedMs = (qpcNow.QuadPart - qpcStart.QuadPart) * 1000.0 / qpcFreq.QuadPart;
+        BOOL lastFrame = (elapsedMs >= totalMs);
+        float progress = lastFrame ? 1.0f : (float)(elapsedMs / totalMs);
+        float t = data->isRising ? (1.0f - progress) : progress;
+
+        int newW, newH, curX, curY;
+        float alphaFloat;
+        SolveFrame(data, t, screenWidth, screenHeight, taskbarY, capW, capH,
+                   &newW, &newH, &curX, &curY, &alphaFloat);
+
+        // Map the w x h snapshot onto (curX,curY)-(curX+newW,curY+newH). The ghost
+        // window spans the whole screen at (0,0), so screen coords == visual coords.
+        float sx = (w > 0) ? (float)newW / (float)w : 1.0f;
+        float sy = (h > 0) ? (float)newH / (float)h : 1.0f;
+        D2D_MATRIX_3X2_F m;
+        m._11 = sx;          m._12 = 0.0f;
+        m._21 = 0.0f;        m._22 = sy;
+        m._31 = (float)curX; m._32 = (float)curY;
+
+        xform->SetMatrix(m);
+        visual3->SetOpacity(clampf(alphaFloat, 0.0f, 1.0f));
+        dcompDevice->Commit();
+
+        if (firstFrame) {
+            ShowWindow(hGhost, SW_SHOWNOACTIVATE);
+            firstFrame = FALSE;
+        }
+
+        if (lastFrame) break;
+        DwmFlush(); // pace to the compose cycle; per-frame work is trivial now
+    }
+
+    // Reveal the real window while the ghost still shows the final frame, then
+    // tear down the composition.
+    FinalizeRealWindow(data);
+
+    SafeRelease(xform);
+    SafeRelease(visual3);
+    SafeRelease(visual);
+    SafeRelease(dcompTarget);
+    SafeRelease(dcompDevice);
+    SafeRelease(swapChain);
+    return true;
+}
+
+// -------------------------------------------------------------------------
+// Animation Thread
+// -------------------------------------------------------------------------
+DWORD WINAPI GhostAnimationThread(LPVOID lpParam) {
+    GhostAnimData* data = (GhostAnimData*)lpParam;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
+
+    RECT workArea;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    float taskbarY = (float)workArea.bottom;
+
+    bool useGpu = EnsureGpuDevice();
+    HWND hGhost = NULL;
+
+    if (useGpu) {
+        // No redirection bitmap: DirectComposition owns every pixel. Full-screen
+        // so content can travel anywhere without being clipped to the window rect.
+        hGhost = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
+                WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            L"STATIC", NULL, WS_POPUP,
+            0, 0, screenWidth, screenHeight, NULL, NULL, NULL, NULL);
+
+        if (!hGhost || !RunGpuAnim(data, hGhost, screenWidth, screenHeight, taskbarY)) {
+            useGpu = false;
+            if (hGhost) { DestroyWindow(hGhost); hGhost = NULL; }
+        }
+    }
+
+    if (!useGpu) {
+        // Layered popup sized to the window rect, shown once configured.
+        hGhost = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+            L"STATIC", NULL, WS_POPUP,
+            data->targetRect.left, data->targetRect.top, data->width, data->height,
+            NULL, NULL, NULL, NULL);
+        RunCpuAnim(data, hGhost, screenWidth, screenHeight, taskbarY);
+    }
+
+    if (hGhost) DestroyWindow(hGhost);
+    DeleteObject(data->hBitmap);
     delete data;
     return 0;
 }
@@ -679,10 +963,15 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModUninit() {
-    std::lock_guard<std::mutex> lock(g_CacheMutex);
-    for (auto& pair : g_SnapshotCache) {
-        DeleteObject(pair.second);
+    {
+        std::lock_guard<std::mutex> lock(g_CacheMutex);
+        for (auto& pair : g_SnapshotCache) {
+            DeleteObject(pair.second);
+        }
+        g_SnapshotCache.clear();
+        g_IconPositions.clear();
     }
-    g_SnapshotCache.clear();
-    g_IconPositions.clear();
+    // Any in-flight animation threads own their own DirectComposition devices and
+    // will finish shortly; only the shared D3D device + factory live here.
+    ReleaseGpuDevice();
 }
