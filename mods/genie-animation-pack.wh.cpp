@@ -615,7 +615,7 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
     IDCompositionDesktopDevice*  dcompDevice = nullptr;
     IDCompositionTarget*         dcompTarget = nullptr;
     IDCompositionVisual2*        visual      = nullptr;
-    IDCompositionVisual3*        visual3     = nullptr;
+    IDCompositionEffectGroup*    effectGroup = nullptr;   // carries opacity (pre-Visual3)
     IDCompositionMatrixTransform* xform      = nullptr;
     bool ok = false;
 
@@ -678,9 +678,10 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
             SUCCEEDED(dcompDevice->CreateTargetForHwnd(hGhost, TRUE, &dcompTarget)) &&
             SUCCEEDED(dcompDevice->CreateVisual(&visual)) &&
             SUCCEEDED(dcompDevice->CreateMatrixTransform(&xform)) &&
-            SUCCEEDED(visual->QueryInterface(__uuidof(IDCompositionVisual3), (void**)&visual3))) {
+            SUCCEEDED(dcompDevice->CreateEffectGroup(&effectGroup))) {
             visual->SetContent(swapChain);
             visual->SetTransform(xform);
+            visual->SetEffect(effectGroup);   // opacity is animated on the effect group
             dcompTarget->SetRoot(visual);
             ok = true;
         }
@@ -691,7 +692,7 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
 
     if (!ok) {
         SafeRelease(xform);
-        SafeRelease(visual3);
+        SafeRelease(effectGroup);
         SafeRelease(visual);
         SafeRelease(dcompTarget);
         SafeRelease(dcompDevice);
@@ -731,7 +732,7 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
         m._31 = (float)curX; m._32 = (float)curY;
 
         xform->SetMatrix(m);
-        visual3->SetOpacity(clampf(alphaFloat, 0.0f, 1.0f));
+        effectGroup->SetOpacity(clampf(alphaFloat, 0.0f, 1.0f));
         dcompDevice->Commit();
 
         if (firstFrame) {
@@ -748,7 +749,7 @@ static bool RunGpuAnim(GhostAnimData* data, HWND hGhost,
     FinalizeRealWindow(data);
 
     SafeRelease(xform);
-    SafeRelease(visual3);
+    SafeRelease(effectGroup);
     SafeRelease(visual);
     SafeRelease(dcompTarget);
     SafeRelease(dcompDevice);
