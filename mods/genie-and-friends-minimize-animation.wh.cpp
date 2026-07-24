@@ -1,9 +1,9 @@
 // ==WindhawkMod==
-// @id              genie-minimize-animation-fork
+// @id              genie-and-friends-minimize-animation
 // @name            Genie + Friends minimize animation pack
-// @description     GPU-accelerated macOS/Compiz-style minimize & restore effects — Genie (true mesh bend), Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up & Swirl.
-// @version         2.2.1
-// @author          lolstijl & akilluminati47
+// @description     GPU-accelerated macOS/Compiz-style minimize & restore effects: Genie (true mesh bend), Vacuum, Glide, Pop, Slide, Free Fall, Warp, Squash, Roll-Up & Swirl.
+// @version         2.2.2
+// @author          akilluminati47
 // @github          https://github.com/akilluminati47
 // @include         *
 // @compilerOptions -ldwmapi -lgdi32 -ld3d11 -ldxgi -ldcomp -ld3dcompiler
@@ -13,58 +13,68 @@
 /*
 # Genie + Friends minimize animation pack
 
-A fork of the Genie Animation Mod that turns Windows 11's boring minimize/restore
-into a whole menu of Compiz/macOS-flavored effects. Pick one from the **Animation
-style** dropdown in the mod's Settings tab — that dropdown is your toggle between the
-classic Genie and all the new ones. Each style has its own **Duration** slider so you
-can tune the feel of every effect independently, and there's a master **Enable
-animations** switch to fall back to stock Windows without disabling the mod.
+A standalone pack that reproduces the classic minimize/restore effects of
+macOS and the Compiz-era Linux desktops, rendered on the GPU. Pick one from
+the **Animation style** dropdown in the mod's Settings tab; that dropdown is
+your toggle between Genie and the nine other reproductions. Each style has
+its own **Duration** slider so you can tune the feel of every effect
+independently, and there's a master **Enable animations** switch to fall back
+to stock Windows without disabling the mod.
 
 ## The effects
 
-- **Genie — Magic Lamp**: the classic. The window stretches and pours down into the
-  taskbar like a genie into a lamp.
-- **Vacuum**: the whole window shrinks and accelerates as it gets sucked into the
-  taskbar icon.
-- **Glide**: subtle GNOME-style shrink + fade in place. Understated and clean.
+- **Genie (Magic Lamp)**: the macOS classic. The window stretches and pours
+  down into the taskbar like a genie into a lamp.
+- **Vacuum**: the whole window shrinks and accelerates as it gets sucked into
+  the taskbar icon.
+- **Glide**: GNOME-style shrink + fade in place. Understated and clean.
 - **Pop**: the window swells slightly and vanishes. Snappy and modern.
 - **Slide**: KDE-style straight drop off the bottom edge.
-- **Free Fall**: gravity takes over — the window accelerates, stretches, sways, and
-  tumbles off the bottom of the screen.
-- **Warp**: Star Trek transporter. The window squeezes into a thin vertical beam of
-  light, then the beam shoots up and dematerializes.
+- **Free Fall**: gravity takes over; the window accelerates, stretches, sways,
+  and tumbles off the bottom of the screen.
+- **Warp**: Star Trek transporter. The window squeezes into a thin vertical
+  beam of light, then the beam shoots up and dematerializes.
 - **Squash**: the window is flattened like a pancake onto the taskbar.
 - **Roll-Up**: the window rolls up into its own title bar like a window blind.
-- **Swirl**: a whirlpool. The window spins side-to-side while shrinking down into
-  the taskbar like water down a drain.
+- **Swirl**: a whirlpool. The window spins side-to-side while shrinking down
+  into the taskbar like water down a drain.
 
-Restore plays every effect in reverse, so windows *un-genie*, *un-roll*, drop back
-in, etc.
+Restore plays every effect in reverse, so windows *un-genie*, *un-roll*, drop
+back in, etc.
 
-## Notes
-- **v2.2.1 — no more first-frame flash.** The minimize/restore hook now waits (up
-  to 40ms) for the ghost's first frame to actually be on screen before the real
+## How it renders
+
+The window snapshot is handed to the GPU compositor (DirectComposition) once,
+and each frame only pushes a transform + opacity. This stays smooth on
+high-refresh displays (120/144/165/180+ Hz) and uses a fraction of the CPU a
+per-frame `StretchBlt` renderer would. Genie goes further: the snapshot is
+rendered as a tessellated mesh warped every frame by a small GPU shader, so
+the window body curves into a thin neck that pours into the taskbar (the real
+Magic Lamp look). The other nine effects use the cheap single-transform GPU
+path. If the GPU/shader path can't initialize in a given process, the mod
+silently falls back to a GDI renderer, so nothing breaks.
+
+## Changelog
+
+- **v2.2.2**: the pack stands on its own as `genie-and-friends-minimize-animation`.
+- **v2.2.1**: first-frame anti-flash. The minimize/restore hook waits (up to
+  40ms) for the ghost's first frame to actually be on screen before the real
   window changes, so the window can't blink out a few ms before the animation
   appears when GPU setup is momentarily slow.
-- **v2.1 — GPU rendering.** The snapshot is now handed to the GPU compositor
-  (DirectComposition) once, and each frame only pushes a transform + opacity. This
-  is dramatically smoother on high-refresh displays (120/144/165/180+ Hz) and uses a
-  fraction of the CPU the old per-frame `StretchBlt` did. If DirectComposition isn't
-  available in a given process, it silently falls back to the original GDI renderer,
-  so nothing breaks.
-- **v2.2 — true Genie bend.** Genie is no longer a shrink + slide fake: it now renders
-  the snapshot as a tessellated mesh warped every frame by a small GPU shader, so the
-  window body curves into a thin neck that pours into the taskbar (real Magic Lamp).
-  The other nine effects keep the cheap single-transform GPU path. If the shader stack
-  can't init, Genie falls back to the affine/GDI renderer.
-- Windows' own animation API is ancient, so a couple of effects (Warp especially) are
-  clever fakes rather than true 3D — but they read great in motion.
+- **v2.2**: true Genie bend via tessellated mesh + GPU warp shader, replacing
+  the shrink + slide approximation.
+- **v2.1**: GPU rendering via DirectComposition, with GDI fallback.
+- Windows' own animation API is ancient, so a couple of effects (Warp
+  especially) are clever fakes rather than true 3D, but they read great in
+  motion.
+
 ## Credits
-Built on the original **Genie Animation Mod**. **lolstijl** extended it into this
-multi-effect pack (Genie + nine more Compiz/macOS-style effects). **akilluminati47**
-then rewrote the rendering onto the GPU (DirectComposition), added the true
-mesh-warped Genie bend, and the anti-flash timing fix. Development was assisted by
-Claude and Gemini.
+
+The effect selection and the original Genie math originate from **lolstijl**'s
+multi-effect pack, which itself built on the original Genie Animation Mod.
+This pack is maintained by **akilluminati47**, who wrote the GPU
+(DirectComposition) renderer, the mesh-warped Genie bend, and the anti-flash
+timing fix. Development was assisted by Claude and Gemini.
 */
 // ==/WindhawkModReadme==
 
@@ -80,58 +90,58 @@ Claude and Gemini.
   $name: Animation style
   $description: >-
     Which effect plays when you minimize or restore a window. This is your toggle
-    between the classic Genie and all the new Linux-flavored effects. Restore always
+    between the classic Genie and the other reproduced effects. Restore always
     plays the same effect in reverse.
   $options:
-  - genie: Genie — Magic Lamp (pours into the taskbar)
-  - vacuum: Vacuum — sucked into the taskbar icon
-  - glide: Glide — GNOME-style shrink & fade
-  - pop: Pop — swell and vanish
-  - slide: Slide — straight drop off the bottom (KDE)
-  - fall: Free Fall — gravity tumble off screen
-  - warp: Warp — Star Trek transporter beam
-  - squash: Squash — flattened onto the taskbar
-  - rollup: Roll-Up — rolls up like a window blind
-  - swirl: Swirl — whirlpool down the drain
+  - genie: Genie - Magic Lamp (pours into the taskbar)
+  - vacuum: Vacuum - sucked into the taskbar icon
+  - glide: Glide - GNOME-style shrink & fade
+  - pop: Pop - swell and vanish
+  - slide: Slide - straight drop off the bottom (KDE)
+  - fall: Free Fall - gravity tumble off screen
+  - warp: Warp - Star Trek transporter beam
+  - squash: Squash - flattened onto the taskbar
+  - rollup: Roll-Up - rolls up like a window blind
+  - swirl: Swirl - whirlpool down the drain
 
 - duration_genie: 450
-  $name: Duration — Genie (ms)
+  $name: Duration - Genie (ms)
   $description: Clamped to 50-3000. Lower is snappier, higher is more deliberate.
 
 - duration_vacuum: 380
-  $name: Duration — Vacuum (ms)
+  $name: Duration - Vacuum (ms)
   $description: Clamped to 50-3000.
 
 - duration_glide: 300
-  $name: Duration — Glide (ms)
+  $name: Duration - Glide (ms)
   $description: Clamped to 50-3000.
 
 - duration_pop: 260
-  $name: Duration — Pop (ms)
+  $name: Duration - Pop (ms)
   $description: Clamped to 50-3000.
 
 - duration_slide: 340
-  $name: Duration — Slide (ms)
+  $name: Duration - Slide (ms)
   $description: Clamped to 50-3000.
 
 - duration_fall: 620
-  $name: Duration — Free Fall (ms)
+  $name: Duration - Free Fall (ms)
   $description: Clamped to 50-3000.
 
 - duration_warp: 520
-  $name: Duration — Warp (ms)
+  $name: Duration - Warp (ms)
   $description: Clamped to 50-3000.
 
 - duration_squash: 400
-  $name: Duration — Squash (ms)
+  $name: Duration - Squash (ms)
   $description: Clamped to 50-3000.
 
 - duration_rollup: 380
-  $name: Duration — Roll-Up (ms)
+  $name: Duration - Roll-Up (ms)
   $description: Clamped to 50-3000.
 
 - duration_swirl: 700
-  $name: Duration — Swirl (ms)
+  $name: Duration - Swirl (ms)
   $description: Clamped to 50-3000.
 */
 // ==/WindhawkModSettings==
@@ -255,7 +265,7 @@ template <class T> static inline void SafeRelease(T*& p) {
 // drops to a few floats + a Commit, which never misses the frame budget.
 //
 // One D3D11 device + DXGI factory are created lazily per process and reused for
-// every animation (device creation is tens of ms — far too slow to do per
+// every animation (device creation is tens of ms - far too slow to do per
 // minimize). Each animation gets its own lightweight DirectComposition device
 // so its hot loop needs no locks. If any of this fails (no GPU, locked-down
 // process, older Windows), we fall back to the original GDI renderer.
@@ -319,8 +329,8 @@ static void ReleaseGpuDevice() {
 //
 // The other nine effects are pure scale+translate+fade, so they upload the
 // snapshot once and only push a transform per frame. Genie's signature is a
-// non-affine bend — the window body curves into a thin neck that pours into the
-// taskbar — which a single matrix can't express. So Genie instead renders a
+// non-affine bend - the window body curves into a thin neck that pours into the
+// taskbar - which a single matrix can't express. So Genie instead renders a
 // tessellated, textured grid of the snapshot every frame with a tiny HLSL
 // shader, displacing each grid row toward the dock.
 //
@@ -426,7 +436,7 @@ static bool EnsureGenieGpuResources() {
         if (FAILED(ihr)) return false;
     }
 
-    // Constant buffer (alpha) — dynamic, updated per frame.
+    // Constant buffer (alpha) - dynamic, updated per frame.
     {
         D3D11_BUFFER_DESC bd;
         ZeroMemory(&bd, sizeof(bd));
@@ -447,7 +457,7 @@ static bool EnsureGenieGpuResources() {
         if (FAILED(g_d3dDevice->CreateSamplerState(&sd, &g_gSampler))) return false;
     }
 
-    // Cull nothing — the warp can flip triangle winding.
+    // Cull nothing - the warp can flip triangle winding.
     {
         D3D11_RASTERIZER_DESC rd;
         ZeroMemory(&rd, sizeof(rd));
@@ -511,7 +521,7 @@ static void SolveFrame(const GhostAnimData* d, float t,
     switch (d->mode) {
 
     case MODE_GENIE: {
-        // Verbatim math from the original mod — the proven Magic Lamp look.
+        // Verbatim math from the original mod - the proven Magic Lamp look.
         float invT  = 1.0f - t;
         float moveX = 1.0f - (invT * invT * invT * invT * invT * invT);
         float moveY = (0.70f * (t * t)) + (0.10f * t);
@@ -1062,7 +1072,7 @@ static bool RunGpuGenieAnim(GhostAnimData* data, HWND hGhost,
         return false;
     }
 
-    // Genie shape constants — tweak to taste.
+    // Genie shape constants - tweak to taste.
     const float LEAD     = 1.4f;                          // how far the window's bottom leads its top into the neck
     const float neckW    = (w * 0.05f > 10.0f) ? w * 0.05f : 10.0f; // drained-neck width (px)
     const float sourceCX = data->targetRect.left + w * 0.5f;
@@ -1316,7 +1326,7 @@ void StartGenieAnim(HWND hWnd, BOOL rising) {
 
     // Anti-flash: block the caller (the minimize/restore hook) until the ghost's
     // first frame is on screen, so the real window never changes before the
-    // animation exists. Use a LOCAL copy of the handle for the wait — once the
+    // animation exists. Use a LOCAL copy of the handle for the wait - once the
     // thread is spawned it owns `data` and may free it at any time. The cap (40ms)
     // sits under the 50ms minimum duration, so the thread's CloseHandle at
     // animation end can never race this bounded wait.
